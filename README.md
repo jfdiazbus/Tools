@@ -234,29 +234,20 @@ Point `CALENDLY_NOTIFY_CMD` at your own program to use something other than
 
 ## Run it automatically
 
-`calendly start` is per-session, so you need it to run again after a reboot.
-Pick one of these.
+`calendly start` is per-session: the daemon dies with the terminal session, so
+you have to start it again after every reboot. Set up one of the options below
+to have it come up by itself.
 
-### Desktop autostart (recommended — desktop notifications keep working)
+Only one daemon may run per event file. If you set one of these up, do not also
+run `calendly start` — the second daemon refuses to start with
+`already running (pid ...)`. That protection is deliberate, but it is easy to
+mistake for a broken service.
 
-Save this as `~/.config/autostart/calendly.desktop`, replacing `/home/you` with
-your real home directory (the `Exec` line needs an absolute path):
+### systemd user service (recommended)
 
-```ini
-[Desktop Entry]
-Type=Application
-Name=calendly
-Comment=Fire due events and show notifications
-Exec=/home/you/.local/bin/calendly daemon
-Terminal=false
-```
-
-It starts with your next login and inherits the session's `DISPLAY`/
-`WAYLAND_DISPLAY`, so notifications show up normally.
-
-### systemd user service
-
-Save this as `~/.config/systemd/user/calendly.service`:
+The daemon runs in the foreground, so systemd supervises it and can restart it
+if it ever crashes. Save this as
+`~/.config/systemd/user/calendly.service`:
 
 ```ini
 [Unit]
@@ -273,15 +264,69 @@ WantedBy=default.target
 ```sh
 systemctl --user daemon-reload
 systemctl --user enable --now calendly
-systemctl --user status calendly
-journalctl --user -u calendly -f
+systemctl --user status calendly     # expect: active (running)
+journalctl --user -u calendly -f     # live view of alerts and errors
 ```
 
-A user service does not inherit the graphical session environment, so
-`notify-send` may be unavailable to it. If notifications do not appear while
-`calendly notify-test` works in your terminal, use the autostart entry above, or
-force the notification channel with `Environment=CALENDLY_FORCE_DESKTOP=1` plus
-the right `DISPLAY`.
+`enable` starts it at every login, `--now` starts it immediately, and `%h`
+expands to the home directory, so the same unit works for every user. Optional
+hardening: add `RestartSec=5` under `Restart=` so a real startup problem does
+not turn into a burst of restarts.
+
+Once the service is in charge, manage the daemon with systemd rather than with
+`calendly`:
+
+```sh
+systemctl --user stop calendly           # instead of: calendly stop
+systemctl --user restart calendly        # after changing CALENDLY_* variables
+systemctl --user disable --now calendly  # stop and remove from autostart
+```
+
+`calendly stop` still works, but systemd then no longer knows the stop was
+intentional; prefer `systemctl`.
+
+#### Can the service still show notifications?
+
+A user service inherits the environment of the *user manager*, not of your
+terminal. Most desktops import `DISPLAY`/`WAYLAND_DISPLAY` into it, in which case
+notifications work exactly as they do from a shell. The daemon records the
+channel it got when it started:
+
+```sh
+grep "daemon started" ~/.local/state/calendly/calendly.log | tail -1
+# [2026-10-17 00:07:49] daemon started pid=2392040 db=/home/.../events.db notify=desktop
+```
+
+`notify=desktop` means `notify-send` is reachable and alerts pop up normally. If
+it says `notify=stdout`, alerts are only reaching the journal and the log file —
+give the service the session variables explicitly:
+
+```ini
+[Service]
+ExecStart=%h/.local/bin/calendly daemon
+Restart=on-failure
+Environment=DISPLAY=:0
+Environment=WAYLAND_DISPLAY=wayland-1
+```
+
+or use the autostart entry below, which always inherits the live session.
+
+### Desktop autostart (when systemd is not an option)
+
+Save this as `~/.config/autostart/calendly.desktop`, replacing `/home/you` with
+your real home directory (the `Exec` line needs an absolute path):
+
+```ini
+[Desktop Entry]
+Type=Application
+Name=calendly
+Comment=Fire due events and show notifications
+Exec=/home/you/.local/bin/calendly daemon
+Terminal=false
+```
+
+It starts with your next login and inherits the session's `DISPLAY`/
+`WAYLAND_DISPLAY`, so notifications show up normally.
 
 ### Cron, without a long-running daemon
 
@@ -326,13 +371,6 @@ half-written file.
 
 `XDG_DATA_HOME` and `XDG_STATE_HOME` move the defaults above.
 
-### Migrating from the old `calendar` name
-
-On startup, if the old `~/.local/share/calendar/events.db` still exists and the
-new path is empty, it is moved to `~/.local/share/calendly/events.db` (same for
-the log), a stale pid file from the old binary is removed, and the empty old
-directories are cleaned up. Nothing else is required.
-
 ### Limitations
 
 Writes are atomic, but a read-modify-write is not locked, so an `add` that lands
@@ -354,9 +392,34 @@ missing or the daemon has no display. Install the `notify-send` package for your
 distribution, and run `calendly notify-test` in a normal terminal to see which
 channel is used.
 
-**`calendly start` says "already running"** — a daemon is already there. Use
-`calendly stop`, or `calendly start --force` if you really want a second one
+**`calendly start` says "already running"** — a daemon is already there. If you
+run the systemd service, that is expected: use `systemctl --user status calendly`
+instead, and `systemctl --user stop calendly` when you want it gone. Otherwise
+use `calendly stop`, or `calendly start --force` if you really want a second one
 (you do not; two daemons fire every event twice).
+
+**`calendly.service` failed with "already running (pid ...)"** — you had started
+a daemon by hand before enabling the service, so the service could not take over
+the pid file. Hand control to systemd:
+
+```sh
+calendly stop
+systemctl --user reset-failed calendly
+systemctl --user start calendly
+```
+
+After that, do not run `calendly start` again while the service is enabled.
+
+**The alert is in the log but no popup appeared** — `notify-send` succeeded, but
+something still has to draw the notification. Check that a notification daemon
+owns the well-known name:
+
+```sh
+busctl --user list | grep org.freedesktop.Notifications
+```
+
+If nothing shows up, start your notification daemon (GNOME's shell, `mako`,
+`dunst`, `swaync`, ...) — `calendly` only asks it to display the alert.
 
 **An event fired immediately after being added** — the time you gave is already
 in the past. `18:30` rolls over to tomorrow, but `today 18:30` or an absolute
@@ -380,7 +443,7 @@ reloads.
 ```
 include/calendly.hpp   events, time parsing, persistence
 include/notifier.hpp   desktop notification + logging
-include/paths.hpp      XDG directories, path helpers, legacy migration
+include/paths.hpp      XDG directories and path helpers
 src/                   implementations and the CLI (main.cpp)
 tests/                 dependency-free test binary
 ```
